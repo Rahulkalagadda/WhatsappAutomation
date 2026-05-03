@@ -1,0 +1,30 @@
+{
+  "name": "whatsapp-bulk-backend",
+  "version": "1.0.0",
+  "description": "Production-ready WhatsApp bulk messaging API (Express + whatsapp-web.js)",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "dev:frontend": "npm run dev --prefix frontend",
+    "build:frontend": "npm install --prefix frontend && npm run build --prefix frontend"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "whatsapp",
+    "express",
+    "bulk-messaging"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "cors": "^2.8.5",
+    "csv-parser": "^3.2.0",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "multer": "^1.4.5-lts.2",
+    "qrcode": "^1.5.4",
+    "whatsapp-web.js": "^1.26.0"
+  }
+}
