@@ -218,18 +218,32 @@ class WhatsAppManager {
 
     await this.antiSleep();
 
-    // Attempt operation with explicit error catching for detachment
+    // Attempt operation with explicit error catching for detachment and resolution failures
     try {
       const number = chatId.split('@')[0];
-      const contactId = await this.client.getNumberId(number);
-      const target = contactId?._serialized || chatId;
+      let target = chatId;
+      
+      try {
+        const contactId = await this.client.getNumberId(number);
+        if (contactId?._serialized) {
+          target = contactId._serialized;
+        }
+      } catch (idErr) {
+        // Fallback: if ID resolution fails with "No LID", it might be an invalid number
+        // but we'll still try to send directly to the chatId as a last resort.
+        this.logWarn(`ID resolution failed for ${chatId}: ${idErr.message}. Trying direct send...`);
+      }
       
       await this.client.sendMessage(target, message);
       this.messageCountSinceRestart++;
       return { ok: true };
     } catch (e) {
-      if (e.message.includes('detached') || e.message.includes('context destroyed') || e.message.includes('Protocol error')) {
+      const msg = e.message || '';
+      if (msg.includes('detached') || msg.includes('context destroyed') || msg.includes('Protocol error')) {
         throw new Error('STALE_CONTEXT');
+      }
+      if (msg.includes('No LID') || msg.includes('wid')) {
+        throw new Error(`Invalid Number: This contact (${chatId.split('@')[0]}) does not appear to be on WhatsApp.`);
       }
       throw e;
     }
