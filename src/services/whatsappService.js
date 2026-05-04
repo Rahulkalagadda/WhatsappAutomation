@@ -285,7 +285,8 @@ class WhatsAppManager {
   }
 
   async sendBulkSequential({ numbers, recipients, message, maxBatch }) {
-    if (this.sendInProgress) throw new Error('Another bulk job is already in progress');
+    // The lock is now managed at the controller level via acquireSendLock(), 
+    // but we ensure it's set here for safety if called directly.
     this.sendInProgress = true;
     this.stopRequested = false;
 
