@@ -14,6 +14,7 @@ class WhatsAppManager {
     this.lastQrDataUrl = null;
     this.lastError = null;
     this.sendInProgress = false;
+    this.stopRequested = false;
     this.lastSendStats = {
       startedAt: null,
       finishedAt: null,
@@ -286,6 +287,7 @@ class WhatsAppManager {
   async sendBulkSequential({ numbers, recipients, message, maxBatch }) {
     if (this.sendInProgress) throw new Error('Another bulk job is already in progress');
     this.sendInProgress = true;
+    this.stopRequested = false;
 
     const startedAt = new Date().toISOString();
     const errors = [];
@@ -314,6 +316,11 @@ class WhatsAppManager {
 
     try {
       for (let i = 0; i < toProcess.length; i++) {
+        if (this.stopRequested) {
+          this.logWarn('Bulk campaign manually stopped by user.');
+          break;
+        }
+
         const { chatId, variables } = toProcess[i];
         const resolvedMessage = this.renderMessageTemplate(message, variables);
 
@@ -329,9 +336,10 @@ class WhatsAppManager {
           // If internet is lost, wait indefinitely until restored
           if (e.message.includes('network') || e.message.includes('internet')) {
             this.logWarn('Internet loss detected. Pausing campaign...');
-            while (!(await this.ensurePageIsStable())) {
+            while (!(await this.ensurePageIsStable()) && !this.stopRequested) {
               await sleep(5000);
             }
+            if (this.stopRequested) break;
             this.logInfo('Internet/Page restored. Resuming...');
             i--; // Retry this one
             failed--;
@@ -349,16 +357,39 @@ class WhatsAppManager {
         if (i < toProcess.length - 1) {
           const delay = randomIntInclusive(15000, 35000); // 15-35 seconds
           this.logInfo(`Waiting ${Math.round(delay/1000)}s for anti-spam throttle...`);
-          await sleep(delay);
+          
+          // Check for stop every 1s during the long delay
+          let waited = 0;
+          while (waited < delay && !this.stopRequested) {
+            await sleep(1000);
+            waited += 1000;
+          }
         }
       }
     } finally {
       this.sendInProgress = false;
+      this.stopRequested = false;
       this.lastSendStats.finishedAt = new Date().toISOString();
       this.logInfo(`Campaign finished. Total: ${toProcess.length}, Sent: ${sent}, Failed: ${failed}`);
     }
 
     return this.lastSendStats;
+  }
+
+  cancelBulkJob() {
+    if (this.sendInProgress) {
+      this.stopRequested = true;
+      this.logInfo('Stop signal sent to active job.');
+      return true;
+    }
+    return false;
+  }
+
+  forceResetLock() {
+    this.sendInProgress = false;
+    this.stopRequested = false;
+    this.logWarn('Lock force-reset! Use with caution.');
+    return true;
   }
 }
 
@@ -382,6 +413,8 @@ module.exports = {
     return true;
   },
   releaseSendLock: () => { manager.sendInProgress = false; },
+  cancelBulkJob: () => manager.cancelBulkJob(),
+  forceResetLock: () => manager.forceResetLock(),
   renderMessageTemplate: (t, v) => manager.renderMessageTemplate(t, v),
   sendBulkSequential: (p) => manager.sendBulkSequential(p),
 };

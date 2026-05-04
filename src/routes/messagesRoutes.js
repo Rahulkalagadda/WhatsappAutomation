@@ -17,5 +17,7 @@ router.post(
 );
 
 router.get('/messages/last-stats', messagesController.lastStats);
+router.post('/messages/cancel', messagesController.cancel);
+router.post('/messages/reset', messagesController.reset);
 
 module.exports = router;

@@ -64,11 +64,16 @@ async function preview(req, res) {
  * POST /messages/send
  */
 async function send(req, res) {
-  /** Hold lock for entire handler to avoid races between validation and send. */
+  /** Allow manual override if "force" is passed in query or body */
+  const force = req.query?.force === 'true' || req.body?.force === 'true';
+  if (force) {
+    whatsappService.forceResetLock();
+  }
+
   if (!whatsappService.acquireSendLock()) {
     return res.status(409).json({
       ok: false,
-      error: 'A bulk send is already in progress. Try again when it finishes.',
+      error: 'A bulk send is already in progress. Use "force=true" to override.',
       code: 'SEND_IN_PROGRESS',
     });
   }
@@ -130,8 +135,33 @@ function lastStats(_req, res) {
   });
 }
 
+/**
+ * POST /messages/cancel
+ */
+function cancel(_req, res) {
+  const stopped = whatsappService.cancelBulkJob();
+  return res.json({
+    ok: true,
+    stopped,
+    message: stopped ? 'Bulk campaign stopped.' : 'No active campaign to stop.',
+  });
+}
+
+/**
+ * POST /messages/reset
+ */
+function reset(_req, res) {
+  whatsappService.forceResetLock();
+  return res.json({
+    ok: true,
+    message: 'Bulk job lock has been force-reset.',
+  });
+}
+
 module.exports = {
   preview,
   send,
   lastStats,
+  cancel,
+  reset,
 };
