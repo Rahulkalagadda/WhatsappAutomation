@@ -3,7 +3,7 @@ const QRCode = require('qrcode');
 const config = require('../config');
 const { sleep, randomIntInclusive } = require('../utils/delay');
 
-const LOG = '[WhatsApp]';
+const LOG = '[WhatsApp-Pro]';
 
 /** @typedef {'disconnected'|'initializing'|'qr_pending'|'authenticated'|'ready'|'error'|'reconnecting'} ConnState */
 
@@ -15,6 +15,7 @@ class WhatsAppManager {
     this.lastError = null;
     this.sendInProgress = false;
     this.stopRequested = false;
+    this.messageCountSinceRestart = 0;
     this.lastSendStats = {
       startedAt: null,
       finishedAt: null,
@@ -24,9 +25,8 @@ class WhatsAppManager {
       truncated: 0,
       testMode: false,
       errors: [],
+      currentIndex: 0, // Checkpoint resume support
     };
-    this.retryCount = 0;
-    this.maxRetries = 3;
   }
 
   logInfo(...args) { console.log(LOG, ...args); }
@@ -39,31 +39,71 @@ class WhatsAppManager {
   }
 
   /**
-   * Checks if the browser page is still alive and responsive.
-   * This addresses the "detached frame" issue by verifying the execution context.
+   * Watchdog to monitor page health and detect silent crashes.
    */
-  async ensurePageIsStable() {
+  async checkHealth() {
     if (!this.client || !this.client.pupPage) return false;
     try {
-      // Try a simple evaluation to see if the context is still valid
+      // Check if browser is still connected
+      if (this.client.pupBrowser && !this.client.pupBrowser.isConnected()) return false;
+      // Ping the context
       await this.client.pupPage.evaluate(() => window.WWebJS !== undefined);
       return true;
     } catch (e) {
-      this.logWarn('Page instability detected (detached frame or context destroyed). Recovering...');
       return false;
     }
   }
 
   /**
-   * Anti-sleep/Keep-alive logic to prevent Chrome from throttling or sleeping
+   * Full destructive rebuild of the browser and client instance.
+   * Essential for recovering from "Detached Frame" errors.
    */
+  async rebuildClient() {
+    this.logWarn('CRITICAL: Page instability detected. Initiating FULL client rebuild...');
+    
+    // 1. Cleanup current instance
+    try {
+      if (this.client) {
+        await this.client.destroy();
+      }
+    } catch (e) {
+      this.logWarn('Cleanup error during rebuild (ignored):', e.message);
+    } finally {
+      this.client = null;
+      this.setConnState('disconnected');
+    }
+
+    await sleep(3000);
+
+    // 2. Initialize fresh
+    await this.initializeClient();
+
+    // 3. Block until READY or TIMEOUT
+    let timeout = 120; // 2 minutes for full boot and auth
+    while (this.connState !== 'ready' && timeout > 0) {
+      if (this.connState === 'qr_pending') {
+        this.logError('REBUILD FAILED: Session lost. Scan QR code to resume.');
+        throw new Error('REBUILD_AUTH_REQUIRED');
+      }
+      await sleep(1000);
+      timeout--;
+    }
+
+    if (this.connState !== 'ready') {
+      throw new Error('REBUILD_TIMEOUT');
+    }
+
+    this.logInfo('SUCCESS: Client rebuilt and recovered.');
+    this.messageCountSinceRestart = 0;
+  }
+
   async antiSleep() {
     if (!this.client || !this.client.pupPage) return;
     try {
-      await this.client.pupPage.mouse.move(randomIntInclusive(0, 100), randomIntInclusive(0, 100));
-    } catch (e) {
-      // Ignore mouse errors
-    }
+      await this.client.pupPage.mouse.move(randomIntInclusive(0, 500), randomIntInclusive(0, 500));
+      // Subtle click in a safe area to keep DOM active
+      await this.client.pupPage.mouse.click(1, 1);
+    } catch (e) {}
   }
 
   attachClientListeners(c) {
@@ -71,60 +111,43 @@ class WhatsAppManager {
       try {
         this.lastQrDataUrl = await QRCode.toDataURL(qr, { margin: 2, width: 256 });
         this.setConnState('qr_pending');
-        this.logInfo('QR generated; scan from GET /auth/qr');
+        this.logInfo('QR code generated. Scan required.');
       } catch (e) {
-        this.logError('Failed to render QR image:', e.message);
-        this.lastQrDataUrl = null;
+        this.logError('QR generation error:', e.message);
       }
     });
 
     c.on('authenticated', () => {
       this.setConnState('authenticated');
-      this.logInfo('session authenticated');
+      this.logInfo('Session authenticated.');
     });
 
     c.on('ready', () => {
       this.setConnState('ready');
       this.lastQrDataUrl = null;
-      this.logInfo('client ready as', c.info?.pushname || c.info?.wid?.user || 'unknown');
+      this.logInfo('WhatsApp Ready. User:', c.info?.pushname || 'Authenticated');
     });
 
     c.on('auth_failure', (msg) => {
       this.lastError = String(msg);
       this.setConnState('error');
-      this.logError('auth_failure:', msg);
+      this.logError('Auth Failure:', msg);
     });
 
     c.on('disconnected', async (reason) => {
-      this.logWarn('disconnected:', reason);
-      this.lastQrDataUrl = null;
+      this.logWarn('Client disconnected:', reason);
       this.setConnState('disconnected');
-      
-      // Auto-reconnect logic if it wasn't a deliberate logout
-      if (reason !== 'NAVIGATION') {
-        this.logInfo('Attempting auto-reconnect...');
-        await this.initializeClient();
-      }
-    });
-
-    c.on('change_state', (s) => {
-      this.logInfo('puppeteer internal state:', s);
+      // If we're in the middle of a send, the loop will detect this and trigger rebuild
     });
   }
 
   async initializeClient() {
-    if (this.client && (this.connState === 'ready' || this.connState === 'initializing')) {
-      this.logInfo('initialize skipped: client already active');
-      return;
-    }
-
     this.setConnState('initializing');
-    this.lastError = null;
-
+    
     this.client = new Client({
       authStrategy: new LocalAuth({ clientId: config.whatsappClientId }),
       puppeteer: {
-        headless: false, // Set to true for production if no UI is needed
+        headless: false,
         executablePath: 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
         args: [
           '--no-sandbox',
@@ -137,10 +160,8 @@ class WhatsAppManager {
           '--disable-extensions',
           '--disable-background-timer-throttling',
           '--disable-backgrounding-occluded-windows',
-          '--disable-breakpad',
-          '--disable-component-extensions-with-background-pages',
-          '--disable-ipc-flooding-protection',
           '--disable-renderer-backgrounding',
+          '--js-flags="--max-old-space-size=4096"', // Memory optimization
         ],
       },
       webVersionCache: {
@@ -154,22 +175,8 @@ class WhatsAppManager {
     try {
       await this.client.initialize();
     } catch (err) {
-      this.lastError = err.message;
+      this.logError('Init failed:', err.message);
       this.setConnState('error');
-      this.logError('initialize failed:', err);
-    }
-  }
-
-  async destroyClient() {
-    if (!this.client) return;
-    try {
-      await this.client.destroy();
-    } catch (e) {
-      this.logWarn('destroy error (ignored):', e.message);
-    } finally {
-      this.client = null;
-      this.setConnState('disconnected');
-      this.lastQrDataUrl = null;
     }
   }
 
@@ -201,74 +208,30 @@ class WhatsAppManager {
     };
   }
 
-  /**
-   * Core function to send one message with massive reliability checks.
-   */
   async sendOne(chatId, message) {
-    if (config.testMode) {
-      this.logInfo(`[TEST_MODE] would send to ${chatId}:`, message.slice(0, 80) + (message.length > 80 ? '…' : ''));
-      return { ok: true, testMode: true };
+    if (config.testMode) return { ok: true, testMode: true };
+
+    const isHealthy = await this.checkHealth();
+    if (!isHealthy || this.connState !== 'ready') {
+      throw new Error('STALE_CONTEXT');
     }
 
-    // 1. Pre-flight check: Is the page stable?
-    const stable = await this.ensurePageIsStable();
-    if (!stable || !this.client || this.connState !== 'ready') {
-      this.logWarn('Client not ready or page unstable. Waiting for recovery...');
-      // Wait up to 30 seconds for 'ready' state
-      let waited = 0;
-      while (this.connState !== 'ready' && waited < 30) {
-        await sleep(1000);
-        waited++;
-      }
-      if (this.connState !== 'ready') throw new Error('WhatsApp client recovery timeout');
-    }
-
-    // 2. Anti-sleep move
     await this.antiSleep();
 
-    // 3. Resolve Number ID (with retry for detached frames)
-    let targetId = chatId;
-    let retryAttempt = 0;
-    const maxLocalRetries = 2;
-
-    while (retryAttempt <= maxLocalRetries) {
-      try {
-        const number = chatId.split('@')[0];
-        const contactId = await this.client.getNumberId(number);
-        if (contactId && contactId._serialized) {
-          targetId = contactId._serialized;
-        } else {
-          this.logWarn(`Unrecognized number: ${number}. Will attempt direct send.`);
-        }
-        break; // Success
-      } catch (e) {
-        if (e.message.includes('detached') || e.message.includes('context destroyed')) {
-          this.logWarn(`Detached frame error during ID resolution for ${chatId}. Retry ${retryAttempt + 1}...`);
-          await sleep(2000);
-          retryAttempt++;
-          if (retryAttempt > maxLocalRetries) throw e;
-        } else {
-          throw e;
-        }
+    // Attempt operation with explicit error catching for detachment
+    try {
+      const number = chatId.split('@')[0];
+      const contactId = await this.client.getNumberId(number);
+      const target = contactId?._serialized || chatId;
+      
+      await this.client.sendMessage(target, message);
+      this.messageCountSinceRestart++;
+      return { ok: true };
+    } catch (e) {
+      if (e.message.includes('detached') || e.message.includes('context destroyed') || e.message.includes('Protocol error')) {
+        throw new Error('STALE_CONTEXT');
       }
-    }
-
-    // 4. Send Message (with retry for detached frames)
-    retryAttempt = 0;
-    while (retryAttempt <= maxLocalRetries) {
-      try {
-        await this.client.sendMessage(targetId, message);
-        return { ok: true, testMode: false };
-      } catch (e) {
-        if (e.message.includes('detached') || e.message.includes('context destroyed')) {
-          this.logWarn(`Detached frame error during send to ${chatId}. Retry ${retryAttempt + 1}...`);
-          await sleep(2000);
-          retryAttempt++;
-          if (retryAttempt > maxLocalRetries) throw e;
-        } else {
-          throw e;
-        }
-      }
+      throw e;
     }
   }
 
@@ -285,41 +248,36 @@ class WhatsAppManager {
   }
 
   async sendBulkSequential({ numbers, recipients, message, maxBatch }) {
-    // The lock is now managed at the controller level via acquireSendLock(), 
-    // but we ensure it's set here for safety if called directly.
     this.sendInProgress = true;
     this.stopRequested = false;
-
-    const startedAt = new Date().toISOString();
-    const errors = [];
-    let sent = 0;
-    let failed = 0;
 
     const normalizedRecipients = Array.isArray(recipients) && recipients.length
       ? recipients.map((r) => ({ chatId: r.chatId, variables: r.variables || {} }))
       : (numbers || []).map((chatId) => ({ chatId, variables: {} }));
 
-    let toProcess = normalizedRecipients.slice(0, maxBatch);
-    const truncated = normalizedRecipients.length > maxBatch ? normalizedRecipients.length - maxBatch : 0;
-
+    const toProcess = normalizedRecipients.slice(0, maxBatch);
+    
     this.lastSendStats = {
-      startedAt,
+      startedAt: new Date().toISOString(),
       finishedAt: null,
       total: toProcess.length,
       sent: 0,
       failed: 0,
-      truncated,
+      truncated: normalizedRecipients.length - toProcess.length,
       testMode: config.testMode,
       errors: [],
+      currentIndex: 0,
     };
-
-    this.logInfo(`Bulk campaign started: ${toProcess.length} contacts.`);
 
     try {
       for (let i = 0; i < toProcess.length; i++) {
-        if (this.stopRequested) {
-          this.logWarn('Bulk campaign manually stopped by user.');
-          break;
+        this.lastSendStats.currentIndex = i;
+        if (this.stopRequested) break;
+
+        // Periodic Memory Cleanup: Restart browser every 25 messages to stay fresh
+        if (this.messageCountSinceRestart >= 25) {
+          this.logInfo('Performing scheduled memory cleanup (client restart)...');
+          await this.rebuildClient();
         }
 
         const { chatId, variables } = toProcess[i];
@@ -327,83 +285,60 @@ class WhatsAppManager {
 
         try {
           await this.sendOne(chatId, resolvedMessage);
-          sent++;
-          this.logInfo(`[${i + 1}/${toProcess.length}] SENT: ${chatId}`);
+          this.lastSendStats.sent++;
+          this.logInfo(`[${i + 1}/${toProcess.length}] OK: ${chatId}`);
         } catch (e) {
-          failed++;
-          errors.push({ chatId, error: e.message });
-          this.logError(`[${i + 1}/${toProcess.length}] FAIL: ${chatId} - ${e.message}`);
-          
-          // If internet is lost, wait indefinitely until restored
-          if (e.message.includes('network') || e.message.includes('internet')) {
-            this.logWarn('Internet loss detected. Pausing campaign...');
-            while (!(await this.ensurePageIsStable()) && !this.stopRequested) {
-              await sleep(5000);
+          if (e.message === 'STALE_CONTEXT' || e.message.includes('detached')) {
+            this.logWarn(`Detached frame detected at ${chatId}. Triggering REBUILD...`);
+            try {
+              await this.rebuildClient();
+              i--; // Retry the same contact
+              continue;
+            } catch (rebuildErr) {
+              this.logError('REBUILD FAILED FATALLY:', rebuildErr.message);
+              this.lastSendStats.errors.push({ chatId, error: 'Browser crashed and failed to rebuild' });
+              break; 
             }
-            if (this.stopRequested) break;
-            this.logInfo('Internet/Page restored. Resuming...');
-            i--; // Retry this one
-            failed--;
-            errors.pop();
-            continue;
           }
+
+          this.lastSendStats.failed++;
+          this.lastSendStats.errors.push({ chatId, error: e.message });
+          this.logError(`[${i + 1}/${toProcess.length}] FAIL: ${chatId} - ${e.message}`);
         }
 
-        // Update stats in real-time
-        this.lastSendStats.sent = sent;
-        this.lastSendStats.failed = failed;
-        this.lastSendStats.errors = [...errors];
-
-        // Random human-like delay between messages
-        if (i < toProcess.length - 1) {
-          const delay = randomIntInclusive(15000, 35000); // 15-35 seconds
-          this.logInfo(`Waiting ${Math.round(delay/1000)}s for anti-spam throttle...`);
-          
-          // Check for stop every 1s during the long delay
-          let waited = 0;
-          while (waited < delay && !this.stopRequested) {
-            await sleep(1000);
-            waited += 1000;
-          }
+        // Delay between messages
+        if (i < toProcess.length - 1 && !this.stopRequested) {
+          const delay = randomIntInclusive(15000, 30000);
+          await sleep(delay);
         }
       }
     } finally {
       this.sendInProgress = false;
-      this.stopRequested = false;
       this.lastSendStats.finishedAt = new Date().toISOString();
-      this.logInfo(`Campaign finished. Total: ${toProcess.length}, Sent: ${sent}, Failed: ${failed}`);
+      this.logInfo(`Job Finished. Sent: ${this.lastSendStats.sent}, Failed: ${this.lastSendStats.failed}`);
     }
 
     return this.lastSendStats;
   }
 
   cancelBulkJob() {
-    if (this.sendInProgress) {
-      this.stopRequested = true;
-      this.logInfo('Stop signal sent to active job.');
-      return true;
-    }
-    return false;
+    this.stopRequested = true;
+    return true;
   }
 
   forceResetLock() {
     this.sendInProgress = false;
     this.stopRequested = false;
-    this.logWarn('Lock force-reset! Use with caution.');
     return true;
   }
 }
 
-// Singleton instance
 const manager = new WhatsAppManager();
-
-// Auto-initialize on start
 manager.initializeClient();
 
 module.exports = {
   initializeClient: () => manager.initializeClient(),
   destroyClient: () => manager.destroyClient(),
-  logoutAndReinitialize: () => manager.logoutAndReinitialize(),
   getAuthStatus: () => manager.getAuthStatus(),
   getQrDataUrl: () => manager.lastQrDataUrl,
   getLastSendStats: () => manager.lastSendStats,
@@ -416,6 +351,7 @@ module.exports = {
   releaseSendLock: () => { manager.sendInProgress = false; },
   cancelBulkJob: () => manager.cancelBulkJob(),
   forceResetLock: () => manager.forceResetLock(),
+  logoutAndReinitialize: () => manager.logoutAndReinitialize(),
   renderMessageTemplate: (t, v) => manager.renderMessageTemplate(t, v),
   sendBulkSequential: (p) => manager.sendBulkSequential(p),
 };
